@@ -70,6 +70,26 @@ def init_db():
                     CHECK (id = 1)
                 );
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS app_version_store (
+                    id INT PRIMARY KEY DEFAULT 1,
+                    latest_version TEXT NOT NULL DEFAULT '1.0.0',
+                    download_url TEXT,
+                    notes TEXT,
+                    updated_at TIMESTAMPTZ DEFAULT now(),
+                    CHECK (id = 1)
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id SERIAL PRIMARY KEY,
+                    user_name TEXT,
+                    user_email TEXT,
+                    action TEXT NOT NULL,
+                    details TEXT,
+                    created_at TIMESTAMPTZ DEFAULT now()
+                );
+            """)
         conn.commit()
     finally:
         conn.close()
@@ -209,19 +229,79 @@ def xgb_predict_probs(user_params: dict):
     return {cls: float(p) * 100 for cls, p in zip(_xgb_classes, proba)}
 
 
+def log_action(user_name, user_email, action, details=None):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO audit_log (user_name, user_email, action, details) VALUES (%s, %s, %s, %s)",
+                (user_name, user_email, action, details),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 class RecommendRequest(BaseModel):
     well_name: Optional[str] = None
     parameters: Dict[str, float]
     save: bool = False
+    user_name: Optional[str] = None
+    user_email: Optional[str] = None
 
 
 class CriteriaPush(BaseModel):
     criteria: Dict
 
 
+class VersionPush(BaseModel):
+    latest_version: str
+    download_url: Optional[str] = None
+    notes: Optional[str] = None
+
+
 @app.get("/")
 def root():
     return {"status": "ok", "methods_loaded": len(_criteria_cache), "xgb_ready": _xgb_model is not None}
+
+
+@app.get("/version")
+def get_version():
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT latest_version, download_url, notes FROM app_version_store WHERE id = 1")
+            row = cur.fetchone()
+        if not row:
+            return {"latest_version": "1.0.0", "download_url": None, "notes": None}
+        return row
+    finally:
+        conn.close()
+
+
+@app.post("/admin/set_version")
+def set_version(payload: VersionPush, x_admin_token: str = Header(default="")):
+    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(403, "Admin token yanlışdır")
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO app_version_store (id, latest_version, download_url, notes, updated_at)
+                VALUES (1, %s, %s, %s, now())
+                ON CONFLICT (id) DO UPDATE SET
+                    latest_version = EXCLUDED.latest_version,
+                    download_url = EXCLUDED.download_url,
+                    notes = EXCLUDED.notes,
+                    updated_at = now()
+                """,
+                (payload.latest_version, payload.download_url, payload.notes),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "ok", "latest_version": payload.latest_version}
 
 
 @app.get("/criteria")
@@ -236,6 +316,7 @@ def update_criteria(payload: CriteriaPush, x_admin_token: str = Header(default="
     save_criteria_to_db(payload.criteria)
     load_criteria_from_db()
     train_xgb_from_criteria()
+    log_action(None, None, "criteria_updated", f"{len(_criteria_cache)} metod yükləndi (Excel push)")
     return {"status": "ok", "methods": len(_criteria_cache), "xgb_ready": _xgb_model is not None}
 
 
@@ -277,6 +358,8 @@ def recommend(req: RecommendRequest):
             conn.commit()
         finally:
             conn.close()
+        log_action(req.user_name, req.user_email, "well_saved",
+                   f"'{req.well_name.strip()}' -> {best['method']} ({best['combined_pct']:.1f}%)")
 
     return {"results": combined}
 
@@ -314,7 +397,7 @@ def get_well(well_name: str):
 
 
 @app.delete("/wells/{well_name}")
-def delete_well(well_name: str):
+def delete_well(well_name: str, user_name: Optional[str] = None, user_email: Optional[str] = None):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -323,6 +406,22 @@ def delete_well(well_name: str):
         conn.commit()
         if deleted == 0:
             raise HTTPException(404, "Quyu tapılmadı")
+        log_action(user_name, user_email, "well_deleted", well_name)
         return {"status": "deleted", "well_name": well_name}
+    finally:
+        conn.close()
+
+
+@app.get("/audit_log")
+def get_audit_log(limit: int = 200):
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT user_name, user_email, action, details, created_at "
+                "FROM audit_log ORDER BY created_at DESC LIMIT %s",
+                (limit,),
+            )
+            return cur.fetchall()
     finally:
         conn.close()
