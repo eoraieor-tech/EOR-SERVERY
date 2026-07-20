@@ -25,6 +25,7 @@ import psycopg2
 import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -62,6 +63,9 @@ def init_db():
                     updated_at TIMESTAMPTZ DEFAULT now()
                 );
             """)
+            # cedvel artiq movcuddursa da bu sutunlari elave edir (kohne data itmir)
+            cur.execute("ALTER TABLE wells ADD COLUMN IF NOT EXISTS user_name TEXT")
+            cur.execute("ALTER TABLE wells ADD COLUMN IF NOT EXISTS user_email TEXT")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS criteria_store (
                     id INT PRIMARY KEY DEFAULT 1,
@@ -345,15 +349,18 @@ def recommend(req: RecommendRequest):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO wells (well_name, parameters, best_method, best_percentage, updated_at)
-                    VALUES (%s, %s, %s, %s, now())
+                    INSERT INTO wells (well_name, parameters, best_method, best_percentage, user_name, user_email, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, now())
                     ON CONFLICT (well_name) DO UPDATE SET
                         parameters = EXCLUDED.parameters,
                         best_method = EXCLUDED.best_method,
                         best_percentage = EXCLUDED.best_percentage,
+                        user_name = EXCLUDED.user_name,
+                        user_email = EXCLUDED.user_email,
                         updated_at = now()
                     """,
-                    (req.well_name.strip(), json.dumps(req.parameters), best["method"], best["combined_pct"]),
+                    (req.well_name.strip(), json.dumps(req.parameters), best["method"], best["combined_pct"],
+                     req.user_name, req.user_email),
                 )
             conn.commit()
         finally:
@@ -370,7 +377,7 @@ def list_wells():
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                "SELECT well_name, best_method, best_percentage, updated_at "
+                "SELECT well_name, best_method, best_percentage, user_name, user_email, updated_at "
                 "FROM wells ORDER BY updated_at DESC"
             )
             return cur.fetchall()
@@ -425,3 +432,94 @@ def get_audit_log(limit: int = 200):
             return cur.fetchall()
     finally:
         conn.close()
+
+
+def _esc(s):
+    if s is None:
+        return ""
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+@app.get("/admin/dashboard", response_class=HTMLResponse)
+def admin_dashboard():
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT well_name, best_method, best_percentage, user_name, user_email, updated_at "
+                "FROM wells ORDER BY updated_at DESC"
+            )
+            wells = cur.fetchall()
+            cur.execute(
+                "SELECT user_name, user_email, action, details, created_at "
+                "FROM audit_log ORDER BY created_at DESC LIMIT 100"
+            )
+            logs = cur.fetchall()
+    finally:
+        conn.close()
+
+    wells_rows = "".join(
+        "<tr><td>{}</td><td>{}</td><td><b>{}</b></td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+            _esc(w["user_name"]) or "—",
+            _esc(w["user_email"]) or "—",
+            _esc(w["well_name"]),
+            _esc(w["best_method"]),
+            f"{w['best_percentage']:.1f}%" if w["best_percentage"] is not None else "—",
+            _esc(w["updated_at"]),
+        )
+        for w in wells
+    ) or '<tr><td colspan="6" class="empty">Hələ heç bir quyu yoxdur</td></tr>'
+
+    log_rows = "".join(
+        "<tr><td>{}</td><td>{}</td><td><span class='badge'>{}</span></td><td>{}</td><td>{}</td></tr>".format(
+            _esc(l["user_name"]) or "—",
+            _esc(l["user_email"]) or "—",
+            _esc(l["action"]),
+            _esc(l["details"]),
+            _esc(l["created_at"]),
+        )
+        for l in logs
+    ) or '<tr><td colspan="5" class="empty">Hələ heç bir qeyd yoxdur</td></tr>'
+
+    html = f"""<!DOCTYPE html>
+<html lang="az">
+<head>
+<meta charset="UTF-8">
+<title>EOR Screening - İdarəetmə Paneli</title>
+<style>
+    * {{ box-sizing: border-box; }}
+    body {{ background:#0B1220; color:#E2E8F0; font-family: Calibri, Arial, sans-serif;
+            margin:0; padding:32px 40px; }}
+    h1 {{ color:#F8FAFC; font-weight:700; margin-bottom:4px; }}
+    .sub {{ color:#94A3B8; font-size:14px; margin-bottom:0; }}
+    h2 {{ color:#F8FAFC; font-size:17px; margin-top:40px; border-bottom:2px solid #6366F1;
+          padding-bottom:8px; }}
+    table {{ width:100%; border-collapse:collapse; margin-top:14px; background:#111827;
+             border-radius:10px; overflow:hidden; }}
+    th {{ background:#1E293B; color:#94A3B8; text-align:left; padding:10px 14px; font-size:12.5px;
+          text-transform:uppercase; letter-spacing:0.03em; }}
+    td {{ padding:10px 14px; border-top:1px solid #1E293B; font-size:13.5px; }}
+    tr:hover td {{ background:#1a2436; }}
+    .badge {{ background:#6366F1; color:white; padding:2px 9px; border-radius:5px; font-size:11.5px; }}
+    .empty {{ color:#64748B; text-align:center; padding:24px; }}
+</style>
+</head>
+<body>
+    <h1>EOR Screening — İdarəetmə Paneli</h1>
+    <p class="sub">Cəmi {len(wells)} quyu qeydə alınıb · son {len(logs)} əməliyyat göstərilir</p>
+
+    <h2>Quyular (istifadəçi üzrə)</h2>
+    <table>
+        <tr><th>İstifadəçi</th><th>Email</th><th>Quyu adı</th><th>Ən uyğun metod</th>
+            <th>Uyğunluq</th><th>Yenilənmə tarixi</th></tr>
+        {wells_rows}
+    </table>
+
+    <h2>Son Əməliyyatlar (Audit Log)</h2>
+    <table>
+        <tr><th>İstifadəçi</th><th>Email</th><th>Əməliyyat</th><th>Detallar</th><th>Tarix</th></tr>
+        {log_rows}
+    </table>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
